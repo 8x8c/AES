@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>AES-CLI README</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        line-height: 1.6;
+        margin: 2rem;
+        max-width: 900px;
+      }
+      pre {
+        background: #f8f8f8;
+        border: 1px solid #ddd;
+        padding: 1rem;
+        overflow-x: auto;
+      }
+      code {
+        font-family: Consolas, "Courier New", Courier, monospace;
+        font-size: 0.95rem;
+      }
+      h1, h2, h3 {
+        margin-top: 1.5rem;
+      }
+      .note {
+        background: #fffae6;
+        border-left: 4px solid #f1ca02;
+        padding: 0.75rem;
+        margin: 1rem 0;
+      }
+    </style>
+</head>
+<body>
+
+<h1>AES-CLI: A Simple Rust AES Encryption/Decryption Tool</h1>
+
+<p>
+This project provides a command-line utility (CLI) to encrypt or decrypt files using AES-256-GCM in Rust. It also supports generating a 32-byte key from a user-supplied password (<em>--keygen</em>) and offers atomic, in-place (“--over”) encryption/decryption.
+</p>
+
+<hr/>
+
+<h2>Features</h2>
+<ul>
+  <li><strong>Encrypt/Decrypt</strong> files with AES-256-GCM.</li>
+  <li><strong>Key Generation</strong> via PBKDF2-HMAC-SHA256 (using a customizable salt and iteration count).</li>
+  <li><strong>In-Place Mode</strong> (<code>--over</code>) that overwrites the original file atomically with a temporary file + rename.</li>
+  <li>Zeroizes key and plaintext buffers in memory when finished.</li>
+</ul>
+
+<hr/>
+
+<h2>Security Disclaimer</h2>
+
+<div class="note">
+  <strong>Warning:</strong> This is sample cryptographic code. While it uses robust libraries and includes good practices (e.g., AES-GCM, key zeroization, PBKDF2), you should always verify security requirements in production. Consult with security experts, especially if your threat model demands more advanced protection (e.g., Argon2 for password hashing, hardware security modules, etc.).
+</div>
+
+<hr/>
+
+<h2>Building the Project</h2>
+
+<ol>
+  <li>Install Rust (if you don’t have it):<br/>
+    <code>curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh</code>
+  </li>
+  <li>Create or clone this project:</li>
+</ol>
+
+<pre><code>git clone &lt;your-repo&gt;
+cd aes-cli
+</code></pre>
+
+<p>
+  or simply create a new directory and copy the <code>Cargo.toml</code> and <code>main.rs</code> into <code>src/</code>.
+</p>
+
+<ol start="3">
+  <li>Build the project in release mode:</li>
+</ol>
+
+<pre><code>cargo build --release
+</code></pre>
+
+<p>
+This will produce an executable in <code>./target/release/aes-cli</code>.
+</p>
+
+<hr/>
+
+<h2>Cargo.toml</h2>
+
+<p>Below is a sample <code>Cargo.toml</code> that references required dependencies:</p>
+
+<pre><code>[package]
+name = "aes-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aes-gcm = "0.10"
+rand = "0.8"
+anyhow = "1.0"
+zeroize = "1.5"
+rpassword = "7.0"
+pbkdf2 = "0.11"
+hmac = "0.12"
+sha2 = "0.10"
+</code></pre>
+
+<hr/>
+
+<h2>src/main.rs</h2>
+
+<p>The main logic resides here. The relevant code is shown below. It demonstrates:</p>
+<ul>
+  <li><strong>--keygen:</strong> asks the user for a password, uses PBKDF2-HMAC-SHA256 to derive a 32-byte key, then writes it to <code>p.bin</code>.</li>
+  <li><strong>--E [in] [out]:</strong> encrypts a file from <code>[in]</code> to <code>[out]</code>.</li>
+  <li><strong>--D [in] [out]:</strong> decrypts a file from <code>[in]</code> to <code>[out]</code>.</li>
+  <li><strong>--E --over [file]:</strong> encrypts <code>[file]</code> in place (atomic).</li>
+  <li><strong>--D --over [file]:</strong> decrypts <code>[file]</code> in place (atomic).</li>
+</ul>
+
+<pre><code>use anyhow::{anyhow, Context, Result};
+use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::{Aes256Gcm, Nonce};
+use hmac::Hmac;
+use pbkdf2::pbkdf2;
+use rand::RngCore;
+use rpassword::prompt_password;
+use sha2::Sha256;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use zeroize::Zeroize;
+
+// Change these to customize your defaults at compile time.
+const DEFAULT_KEY_FILE: &str = "p.bin";
+const DERIVE_SALT: &str = "MY_SALT_HERE"; // PBKDF2 salt
+
+fn main() -> Result<()> {
+    let args: Vec&lt;String&gt; = env::args().collect();
+
+    // We support:
+    //   --keygen               => derive a key from a user password
+    //   --E &lt;in&gt; &lt;out&gt;         => encrypt from in to out
+    //   --D &lt;in&gt; &lt;out&gt;         => decrypt from in to out
+    //   --E --over &lt;file&gt;      => encrypt file in place (atomic)
+    //   --D --over &lt;file&gt;      => decrypt file in place (atomic)
+
+    if args.len() &lt; 2 {
+        print_usage(&args[0]);
+        std::process::exit(1);
+    }
+
+    // 1) Check for --keygen
+    if args.contains(&"--keygen".to_string()) {
+        keygen_mode()?;
+        return Ok(());
+    }
+
+    // 2) Parse --E / --D plus optional --over
+    let encrypt_index = args.iter().position(|x| x == "--E");
+    let decrypt_index = args.iter().position(|x| x == "--D");
+    let over_index = args.iter().position(|x| x == "--over");
+
+    match (encrypt_index, decrypt_index, over_index) {
+        // --E --over &lt;file&gt;
+        (Some(ei), None, Some(oi)) if ei &lt; oi =&gt; {
+            if args.len() &lt; oi + 2 {
+                eprintln!("Missing file argument for --over mode.");
+                std::process::exit(1);
+            }
+            let file_path = &args[oi + 1];
+            encrypt_in_place(file_path, DEFAULT_KEY_FILE)?;
+        }
+        // --D --over &lt;file&gt;
+        (None, Some(di), Some(oi)) if di &lt; oi =&gt; {
+            if args.len() &lt; oi + 2 {
+                eprintln!("Missing file argument for --over mode.");
+                std::process::exit(1);
+            }
+            let file_path = &args[oi + 1];
+            decrypt_in_place(file_path, DEFAULT_KEY_FILE)?;
+        }
+        // --E &lt;in&gt; &lt;out&gt;
+        (Some(ei), None, None) =&gt; {
+            if args.len() &lt; ei + 3 {
+                eprintln!("Expected: --E &lt;input_file&gt; &lt;output_file&gt;");
+                std::process::exit(1);
+            }
+            let input_path = &args[ei + 1];
+            let output_path = &args[ei + 2];
+            encrypt_file(input_path, output_path, DEFAULT_KEY_FILE)?;
+        }
+        // --D &lt;in&gt; &lt;out&gt;
+        (None, Some(di), None) =&gt; {
+            if args.len() &lt; di + 3 {
+                eprintln!("Expected: --D &lt;input_file&gt; &lt;output_file&gt;");
+                std::process::exit(1);
+            }
+            let input_path = &args[di + 1];
+            let output_path = &args[di + 2];
+            decrypt_file(input_path, output_path, DEFAULT_KEY_FILE)?;
+        }
+        // Else => usage
+        _ =&gt; {
+            print_usage(&args[0]);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_usage(prog_name: &str) {
+    eprintln!(
+        "Usage:
+  {{}} --keygen
+  {{}} --E &lt;input_file&gt; &lt;output_file&gt;
+  {{}} --D &lt;input_file&gt; &lt;output_file&gt;
+  {{}} --E --over &lt;file&gt;
+  {{}} --D --over &lt;file&gt;
+
+* --keygen will derive a 32-byte key from a password (using PBKDF2) \
+  and write it to '{{}}' (by default).
+* --E means encrypt, --D means decrypt.
+* --over performs in-place encryption/decryption with atomic overwrite.",
+        prog_name, DEFAULT_KEY_FILE
+    );
+}
+
+fn keygen_mode() -&gt; Result&lt;()&gt; {
+    // Prompt user for password (hidden)
+    let password = prompt_password("Enter password: ")?;
+    let confirm = prompt_password("Confirm password: ")?;
+    if password != confirm {
+        return Err(anyhow!("Passwords do not match. Aborting."));
+    }
+
+    // Derive a 32-byte key using PBKDF2-HMAC-SHA256
+    let mut key_buf = [0u8; 32];
+    pbkdf2::&lt;Hmac&lt;Sha256&gt;&gt;(
+        password.as_bytes(),
+        DERIVE_SALT.as_bytes(),
+        100_000, // iteration count
+        &amp;mut key_buf,
+    );
+
+    // Write key to file
+    fs::write(DEFAULT_KEY_FILE, &amp;key_buf)
+        .with_context(|| format!("Failed to write key file '{}'", DEFAULT_KEY_FILE))?;
+
+    // Zeroize the password and key buffer
+    let mut pw_vec = password.into_bytes();
+    pw_vec.zeroize();
+    key_buf.zeroize();
+
+    println!("Key derived and written to '{}'.", DEFAULT_KEY_FILE);
+    Ok(())
+}
+
+// ========== In-Place (Atomic) Encryption/Decryption ==========
+
+fn encrypt_in_place(path_str: &str, key_file_path: &str) -&gt; Result&lt;()&gt; {
+    let path = Path::new(path_str);
+
+    // 1. Read file
+    let plaintext = fs::read(path)
+        .with_context(|| format!("Failed to read file '{}'", path.display()))?;
+
+    // 2. Load key
+    let key = load_key(key_file_path)?;
+    if key.len() != 32 {
+        return Err(anyhow!(
+            "Key length must be 32 bytes for AES-256 (got {{}})",
+            key.len()
+        ));
+    }
+
+    // 3. Encrypt
+    let cipher = Aes256Gcm::new_from_slice(&amp;key)
+        .map_err(|e| anyhow!("Failed to create AES-256-GCM: {{:?}}", e))?;
+
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&amp;mut nonce_bytes);
+    let nonce = Nonce::from_slice(&amp;nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_slice())
+        .map_err(|e| anyhow!("Encryption failed: {{:?}}", e))?;
+
+    // 4. Combine [nonce | ciphertext]
+    let mut combined = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+    combined.extend_from_slice(&amp;nonce_bytes);
+    combined.extend_from_slice(&amp;ciphertext);
+
+    // 5. Atomic write
+    atomic_write(path, &amp;combined)?;
+
+    // 6. Zeroize
+    zeroize_memory(key, plaintext);
+    combined.zeroize();
+
+    println!("Encrypted in place: {{}}", path.display());
+    Ok(())
+}
+
+fn decrypt_in_place(path_str: &str, key_file_path: &str) -&gt; Result&lt;()&gt; {
+    let path = Path::new(path_str);
+
+    // 1. Read file
+    let encrypted_file = fs::read(path)
+        .with_context(|| format!("Failed to read file '{}'", path.display()))?;
+
+    if encrypted_file.len() &lt; 12 {
+        return Err(anyhow!(
+            "File '{}' is too short to contain the AES-GCM nonce",
+            path.display()
+        ));
+    }
+
+    // 2. Load key
+    let key = load_key(key_file_path)?;
+    if key.len() != 32 {
+        return Err(anyhow!(
+            "Key length must be 32 bytes for AES-256 (got {{}})",
+            key.len()
+        ));
+    }
+
+    // 3. Separate nonce &amp; ciphertext
+    let (nonce_bytes, ciphertext) = encrypted_file.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let cipher = Aes256Gcm::new_from_slice(&amp;key)
+        .map_err(|e| anyhow!("Failed to create AES-256-GCM: {{:?}}", e))?;
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| anyhow!("Decryption failed: {{:?}}", e))?;
+
+    // 5. Atomic write
+    atomic_write(path, &amp;plaintext)?;
+
+    // 6. Zeroize
+    zeroize_memory(key, plaintext);
+
+    println!("Decrypted in place: {{}}", path.display());
+    Ok(())
+}
+
+// ========== Standard Encrypt/Decrypt ==========
+
+fn encrypt_file(input_path: &str, output_path: &str, key_file_path: &str) -&gt; Result&lt;()&gt; {
+    let key = load_key(key_file_path)?;
+    if key.len() != 32 {
+        return Err(anyhow!(
+            "Key length must be 32 bytes for AES-256 (got {{}})",
+            key.len()
+        ));
+    }
+
+    let plaintext = fs::read(input_path)
+        .with_context(|| format!("Failed to read input file '{}'", input_path))?;
+
+    let cipher = Aes256Gcm::new_from_slice(&amp;key)
+        .map_err(|e| anyhow!("Failed to create AES-256-GCM: {{:?}}", e))?;
+
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&amp;mut nonce_bytes);
+    let nonce = Nonce::from_slice(&amp;nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_slice())
+        .map_err(|e| anyhow!("Encryption failed: {{:?}}", e))?;
+
+    let mut combined = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+    combined.extend_from_slice(&amp;nonce_bytes);
+    combined.extend_from_slice(&amp;ciphertext);
+
+    fs::write(output_path, &amp;combined)
+        .with_context(|| format!("Failed to write output file '{}'", output_path))?;
+
+    zeroize_memory(key, plaintext);
+    combined.zeroize();
+
+    println!("Encrypted: {{}} -&gt; {{}}", input_path, output_path);
+    Ok(())
+}
+
+fn decrypt_file(input_path: &str, output_path: &str, key_file_path: &str) -&gt; Result&lt;()&gt; {
+    let key = load_key(key_file_path)?;
+    if key.len() != 32 {
+        return Err(anyhow!(
+            "Key length must be 32 bytes for AES-256 (got {{}})",
+            key.len()
+        ));
+    }
+
+    let encrypted_file = fs::read(input_path)
+        .with_context(|| format!("Failed to read input file '{}'", input_path))?;
+
+    if encrypted_file.len() &lt; 12 {
+        return Err(anyhow!(
+            "File '{}' is too short to contain a nonce",
+            input_path
+        ));
+    }
+
+    let (nonce_bytes, ciphertext) = encrypted_file.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let cipher = Aes256Gcm::new_from_slice(&amp;key)
+        .map_err(|e| anyhow!("Failed to create AES-256-GCM: {{:?}}", e))?;
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| anyhow!("Decryption failed: {{:?}}", e))?;
+
+    fs::write(output_path, &amp;plaintext)
+        .with_context(|| format!("Failed to write decrypted data to '{}'", output_path))?;
+
+    zeroize_memory(key, plaintext);
+
+    println!("Decrypted: {{}} -&gt; {{}}", input_path, output_path);
+    Ok(())
+}
+
+// ========== Utilities ==========
+
+fn load_key(path: &str) -&gt; Result&lt;Vec&lt;u8&gt;&gt; {
+    fs::read(path).with_context(|| format!("Failed to read key file '{}'", path))
+}
+
+fn atomic_write(path: &Path, data: &[u8]) -&gt; Result&lt;()&gt; {
+    // Create a temporary file in the same directory.
+    let mut tmp_path = PathBuf::from(path);
+    let file_name = match tmp_path.file_name() {
+        Some(name) =&gt; name.to_owned(),
+        None =&gt; {
+            return Err(anyhow!(
+                "Cannot determine file name for atomic write: '{}'",
+                path.display()
+            ));
+        }
+    };
+
+    // e.g., &quot;myfile.txt.tmp&quot;
+    tmp_path.set_file_name(format!("{}.tmp", file_name.to_string_lossy()));
+
+    // 1. Write data to temp file
+    fs::write(&amp;tmp_path, data)
+        .with_context(|| format!("Failed to write temporary file '{}'", tmp_path.display()))?;
+
+    // 2. Rename temp -&gt; original
+    fs::rename(&amp;tmp_path, path).with_context(|| {
+        format!(
+            "Failed to rename '{}' -&gt; '{}'",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn zeroize_memory(mut key: Vec&lt;u8&gt;, mut data: Vec&lt;u8&gt;) {
+    key.zeroize();
+    data.zeroize();
+}
+</code></pre>
+
+<hr/>
+
+<h2>Usage Examples</h2>
+
+<ol>
+  <li><strong>Generate a key using your password:</strong></li>
+</ol>
+
+<pre><code>./target/release/aes-cli --keygen
+</code></pre>
+
+<p>You’ll be prompted for a password. A 32-byte key derived from this password is saved to <code>p.bin</code>.</p>
+
+<ol start="2">
+  <li><strong>Encrypt a file:</strong></li>
+</ol>
+
+<pre><code>./target/release/aes-cli --E secret.txt secret.enc
+</code></pre>
+
+<p>The contents of <code>secret.txt</code> are encrypted using <code>p.bin</code>, and the output is written to <code>secret.enc</code>.</p>
+
+<ol start="3">
+  <li><strong>Decrypt a file:</strong></li>
+</ol>
+
+<pre><code>./target/release/aes-cli --D secret.enc secret.dec
+</code></pre>
+
+<p>This decrypts <code>secret.enc</code> into <code>secret.dec</code>.</p>
+
+<ol start="4">
+  <li><strong>Encrypt a file in place (atomic overwrite):</strong></li>
+</ol>
+
+<pre><code>./target/release/aes-cli --E --over secret.txt
+</code></pre>
+
+<p>The tool creates a temporary file, writes the encrypted content, and then renames it to <code>secret.txt</code>, minimizing risk of corruption if interrupted.</p>
+
+<ol start="5">
+  <li><strong>Decrypt a file in place (atomic overwrite):</strong></li>
+</ol>
+
+<pre><code>./target/release/aes-cli --D --over secret.enc
+</code></pre>
+
+<p>The same strategy is used for in-place decryption.</p>
+
+<hr/>
+
+<h2>Security &amp; Production Considerations</h2>
+
+<ul>
+  <li>Ensure the derived key file (<code>p.bin</code> by default) is stored securely (e.g., correct file permissions).</li>
+  <li>AES-GCM requires that nonces not be reused with the same key. Here, a fresh random 12-byte nonce is generated each time, which is safe for typical usage.</li>
+  <li>For <em>password-based encryption</em>, consider increasing the PBKDF2 iteration count or using a memory-hard KDF like Argon2 or scrypt for stronger brute-force resistance.</li>
+  <li>If in-place overwriting is critical, be aware that different filesystems (especially network filesystems) may not guarantee atomic renames.</li>
+  <li>Always keep dependencies up to date and consider a security audit for production deployments.</li>
+</ul>
+
+<hr/>
+
+<h2>License</h2>
+
+<p>This example is free to use, modify, or distribute. You can include your own licensing here (e.g., MIT, Apache-2.0, etc.).</p>
+
+</body>
+</html>
+

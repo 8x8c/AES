@@ -1,0 +1,16 @@
+
+
+aes-cli --keygen
+
+
+
+
+./aes-cli --E api.html out.html
+
+./aes-cli --D out.html apidecrypted.html
+
+
+
+./aes-cli --E --over <file>
+./aes-cli --D --over <file>
+
