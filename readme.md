@@ -1,4 +1,4 @@
-# a simple command-line utility for encrypting or decrypting files using XChaCha20-Poly1305
+# a simple command-line utility for encrypting or decrypting files using AES-256-GCM 
 
 It is not about the name! You can change the default name in Cargo.toml before you compile or simply rename the executable after it is compiled. 
 
